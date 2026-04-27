@@ -63,9 +63,9 @@ async function initDB() {
     changes TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`);
-  // Права пользователей
+  // Права пользователей (TEXT для совместимости)
   try {
-    await db.query(`ALTER TABLE users ADD COLUMN permissions JSON`);
+    await db.query(`ALTER TABLE users ADD COLUMN permissions TEXT`);
   } catch(e) {}
   // Папка uploads
   if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
@@ -310,6 +310,21 @@ app.get('/api/export/generate', async (req, res) => {
 });
 
 // === ФОТО ===
+app.delete('/api/items/:id/photo', auth, async (req, res) => {
+  try {
+    const [rows] = await db.query('SELECT photo FROM items WHERE id = ?', [req.params.id]);
+    if (rows[0]?.photo) {
+      const filePath = path.join(UPLOADS_DIR, rows[0].photo);
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    }
+    await db.query('UPDATE items SET photo = NULL WHERE id = ?', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка удаления' });
+  }
+});
+
 app.post('/api/items/:id/photo', auth, upload.single('photo'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Файл не получен' });
@@ -382,10 +397,16 @@ app.get('/api/users', auth, async (req, res) => {
   try {
     if (req.user.role !== 'admin') return res.status(403).json({ error: 'Нужны права администратора' });
     const [rows] = await db.query('SELECT id, login, full_name, role, permissions, created_at FROM users');
-    const result = rows.map(u => ({
-      ...u,
-      permissions: u.permissions ? (typeof u.permissions === 'string' ? JSON.parse(u.permissions) : u.permissions) : { can_add: true, can_edit: true, can_delete: false, can_export: true }
-    }));
+    const DEFAULT_PERMS = { can_add: true, can_edit: true, can_delete: false, can_export: true };
+    const result = rows.map(u => {
+      let perms = DEFAULT_PERMS;
+      if (u.permissions) {
+        try {
+          perms = typeof u.permissions === 'string' ? JSON.parse(u.permissions) : u.permissions;
+        } catch(e) { perms = DEFAULT_PERMS; }
+      }
+      return { ...u, permissions: perms };
+    });
     res.json(result);
   } catch (err) {
     console.error(err);
