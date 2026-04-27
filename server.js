@@ -6,6 +6,7 @@ const bwipjs = require('bwip-js');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
+const PDFDocument = require('pdfkit');
 
 const app = express();
 const PORT = 3000;
@@ -46,6 +47,31 @@ let db;
 async function initDB() {
   db = await mysql.createPool(DB_CONFIG);
   console.log('БД подключена');
+  // История изменений
+  await db.query(`CREATE TABLE IF NOT EXISTS item_history (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    item_id INT,
+    user_login VARCHAR(50),
+    action VARCHAR(50),
+    action_label VARCHAR(100),
+    changes TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  )`);
+  // Права пользователей
+  try {
+    await db.query(`ALTER TABLE users ADD COLUMN permissions JSON`);
+  } catch(e) {}
+  // Папка uploads
+  if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
+}
+
+async function logHistory(itemId, userLogin, action, actionLabel, changes) {
+  try {
+    await db.query(
+      'INSERT INTO item_history (item_id, user_login, action, action_label, changes) VALUES (?, ?, ?, ?, ?)',
+      [itemId, userLogin, action, actionLabel, changes ? JSON.stringify(changes) : null]
+    );
+  } catch(e) {}
 }
 
 // === АВТОРИЗАЦИЯ ===
@@ -113,6 +139,7 @@ app.post('/api/items', auth, async (req, res) => {
       [code, name, category || '', location || '', responsible || '', notes || '', status || 'active']
     );
     const [rows] = await db.query('SELECT * FROM items WHERE id = ?', [result.insertId]);
+    await logHistory(result.insertId, req.user.login, 'create', 'Добавлено', { name, code, location });
     res.json(rows[0]);
   } catch (err) {
     console.error(err);
@@ -124,11 +151,19 @@ app.post('/api/items', auth, async (req, res) => {
 app.put('/api/items/:id', auth, async (req, res) => {
   try {
     const { code, name, category, location, responsible, notes, status } = req.body;
+    const [oldRows] = await db.query('SELECT * FROM items WHERE id = ?', [req.params.id]);
     await db.query(
       'UPDATE items SET code=?, name=?, category=?, location=?, responsible=?, notes=?, status=? WHERE id=?',
       [code, name, category || '', location || '', responsible || '', notes || '', status || 'active', req.params.id]
     );
     const [rows] = await db.query('SELECT * FROM items WHERE id = ?', [req.params.id]);
+    const old = oldRows[0] || {};
+    const changes = {};
+    if (old.location !== location) changes['Местонахождение'] = `${old.location} → ${location}`;
+    if (old.responsible !== responsible) changes['Ответственный'] = `${old.responsible} → ${responsible}`;
+    if (old.status !== status) changes['Статус'] = `${old.status} → ${status}`;
+    await logHistory(req.params.id, req.user.login, 'update', 'Изменено',
+      Object.keys(changes).length > 0 ? Object.entries(changes).map(([k,v]) => `${k}: ${v}`).join('; ') : null);
     res.json(rows[0]);
   } catch (err) {
     console.error(err);
@@ -138,11 +173,86 @@ app.put('/api/items/:id', auth, async (req, res) => {
 
 app.delete('/api/items/:id', auth, async (req, res) => {
   try {
+    const [rows] = await db.query('SELECT name, code FROM items WHERE id = ?', [req.params.id]);
     await db.query('DELETE FROM items WHERE id = ?', [req.params.id]);
+    if (rows[0]) await logHistory(req.params.id, req.user.login, 'delete', 'Удалено', { name: rows[0].name });
     res.json({ success: true });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// === ИСТОРИЯ ===
+app.get('/api/items/:id/history', auth, async (req, res) => {
+  try {
+    const [rows] = await db.query(
+      'SELECT * FROM item_history WHERE item_id = ? ORDER BY created_at DESC LIMIT 20',
+      [req.params.id]
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// === ЭКСПОРТ QR в PDF ===
+app.get('/api/export/qr', auth, async (req, res) => {
+  try {
+    let items;
+    if (req.query.ids) {
+      const ids = req.query.ids.split(',').map(Number).filter(Boolean);
+      const placeholders = ids.map(() => '?').join(',');
+      const [rows] = await db.query(`SELECT * FROM items WHERE id IN (${placeholders}) ORDER BY name`, ids);
+      items = rows;
+    } else {
+      const [rows] = await db.query('SELECT * FROM items ORDER BY name');
+      items = rows;
+    }
+
+    const doc = new PDFDocument({ margin: 20, size: 'A4' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'attachment; filename=qr-codes.pdf');
+    doc.pipe(res);
+
+    const cols = 3;
+    const pageW = doc.page.width - 40;
+    const colW = pageW / cols;
+    const qrSize = 90;
+    const cellH = qrSize + 36;
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+
+      if (i > 0 && col === 0) {
+        const nextY = 20 + row * cellH;
+        if (nextY + cellH > doc.page.height - 20) {
+          doc.addPage();
+        }
+      }
+
+      const pageRows = Math.floor((doc.y - 20) / cellH);
+      const curRow = row - pageRows;
+      const x = 20 + col * colW + (colW - qrSize) / 2;
+      const baseY = col === 0 && row > 0 ? doc.y : 20 + Math.floor(i / cols) * cellH;
+      const y = col === 0 ? (i === 0 ? 20 : doc.y + 10) : (doc.y > 20 ? doc.y : 20);
+
+      try {
+        const qrDataUrl = await QRCode.toDataURL(item.code, { width: qrSize, margin: 1 });
+        const buf = Buffer.from(qrDataUrl.split(',')[1], 'base64');
+        doc.image(buf, x, col === 0 ? (i === 0 ? 20 : undefined) : undefined, { width: qrSize });
+      } catch(e) {}
+
+      doc.fontSize(7).fillColor('#333').text(item.code, 20 + col * colW, undefined, { width: colW, align: 'center' });
+      doc.fontSize(6).fillColor('#666').text(item.name.substring(0, 30), 20 + col * colW, undefined, { width: colW, align: 'center' });
+    }
+
+    doc.end();
+  } catch (err) {
+    console.error(err);
+    if (!res.headersSent) res.status(500).json({ error: 'Ошибка генерации PDF' });
   }
 });
 
@@ -202,8 +312,12 @@ app.get('/api/items/:id/barcode', auth, async (req, res) => {
 app.get('/api/users', auth, async (req, res) => {
   try {
     if (req.user.role !== 'admin') return res.status(403).json({ error: 'Нужны права администратора' });
-    const [rows] = await db.query('SELECT id, login, full_name, role, created_at FROM users');
-    res.json(rows);
+    const [rows] = await db.query('SELECT id, login, full_name, role, permissions, created_at FROM users');
+    const result = rows.map(u => ({
+      ...u,
+      permissions: u.permissions ? (typeof u.permissions === 'string' ? JSON.parse(u.permissions) : u.permissions) : { can_add: true, can_edit: true, can_delete: false, can_export: true }
+    }));
+    res.json(result);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Ошибка сервера' });
@@ -230,10 +344,11 @@ app.put('/api/users/:id', auth, async (req, res) => {
   try {
     if (req.user.role !== 'admin') return res.status(403).json({ error: 'Нужны права администратора' });
     const { full_name, role, password } = req.body;
+    const perms = req.body.permissions ? JSON.stringify(req.body.permissions) : null;
     if (password) {
-      await db.query('UPDATE users SET full_name=?, role=?, password=? WHERE id=?', [full_name, role, password, req.params.id]);
+      await db.query('UPDATE users SET full_name=?, role=?, password=?, permissions=? WHERE id=?', [full_name, role, password, perms, req.params.id]);
     } else {
-      await db.query('UPDATE users SET full_name=?, role=? WHERE id=?', [full_name, role, req.params.id]);
+      await db.query('UPDATE users SET full_name=?, role=?, permissions=? WHERE id=?', [full_name, role, perms, req.params.id]);
     }
     res.json({ success: true });
   } catch (err) {
