@@ -34,6 +34,17 @@ function auth(req, res, next) {
   next();
 }
 
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Недостаточно прав' });
+    }
+    next();
+  };
+}
+const canEdit = requireRole('editor', 'admin');
+const adminOnly = requireRole('admin');
+
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
@@ -63,9 +74,12 @@ async function initDB() {
     changes TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
   )`);
-  // Права пользователей (TEXT для совместимости)
+  // Расширяем колонку role до 3 типов: viewer, editor, admin
   try {
-    await db.query(`ALTER TABLE users ADD COLUMN permissions TEXT`);
+    await db.query(`ALTER TABLE users MODIFY COLUMN role VARCHAR(20) DEFAULT 'editor'`);
+  } catch(e) {}
+  try {
+    await db.query(`UPDATE users SET role = 'editor' WHERE role = 'user'`);
   } catch(e) {}
   // Папка uploads
   if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
@@ -83,7 +97,8 @@ async function logHistory(itemId, userLogin, action, actionLabel, changes) {
 // === АВТОРИЗАЦИЯ ===
 app.post('/api/login', async (req, res) => {
   try {
-    const { login, password } = req.body;
+    const login = String(req.body.login || '').trim();
+    const password = String(req.body.password || '').trim();
     const [rows] = await db.query(
       'SELECT * FROM users WHERE login = ? AND password = ?',
       [login, password]
@@ -137,7 +152,7 @@ app.get('/api/items/:id', auth, async (req, res) => {
   }
 });
 
-app.post('/api/items', auth, async (req, res) => {
+app.post('/api/items', auth, canEdit, async (req, res) => {
   try {
     const { code, name, category, location, responsible, notes, status } = req.body;
     const [result] = await db.query(
@@ -154,7 +169,7 @@ app.post('/api/items', auth, async (req, res) => {
   }
 });
 
-app.put('/api/items/:id', auth, async (req, res) => {
+app.put('/api/items/:id', auth, canEdit, async (req, res) => {
   try {
     const { code, name, category, location, responsible, notes, status } = req.body;
     const [oldRows] = await db.query('SELECT * FROM items WHERE id = ?', [req.params.id]);
@@ -177,7 +192,7 @@ app.put('/api/items/:id', auth, async (req, res) => {
   }
 });
 
-app.delete('/api/items/:id', auth, async (req, res) => {
+app.delete('/api/items/:id', auth, adminOnly, async (req, res) => {
   try {
     const [rows] = await db.query('SELECT name, code FROM items WHERE id = ?', [req.params.id]);
     await db.query('DELETE FROM items WHERE id = ?', [req.params.id]);
@@ -263,7 +278,134 @@ async function streamPdf(items, options, res) {
   doc.end();
 }
 
-// Экспорт существующих позиций
+// === HTML экспорт для печати/PDF ===
+const SIZE_PX = { small: 90, medium: 140, large: 200 };
+const SIZE_COLS = { small: 5, medium: 4, large: 3 };
+
+async function genCodeDataUrl(code, type) {
+  if (type === 'barcode') {
+    const buf = await bwipjs.toBuffer({
+      bcid: 'code128', text: code, scale: 3, height: 12,
+      includetext: false, paddingwidth: 5,
+    });
+    return `data:image/png;base64,${buf.toString('base64')}`;
+  }
+  return await QRCode.toDataURL(code, { width: 300, margin: 1 });
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+
+function renderPrintHtml(items, type, size) {
+  const px = SIZE_PX[size] || 90;
+  const cols = SIZE_COLS[size] || 5;
+  const cells = items.map(item => `
+    <div class="cell">
+      <img src="${item.img}" />
+      <div class="code">${escapeHtml(item.code)}</div>
+      ${item.name ? `<div class="name">${escapeHtml(item.name.substring(0, 28))}</div>` : ''}
+    </div>
+  `).join('');
+
+  return `<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Печать кодов — ${items.length} шт.</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; background: #f5f5f5; padding: 0; }
+  .toolbar { background: #1976D2; color: #fff; padding: 16px; position: sticky; top: 0; z-index: 10; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
+  .toolbar h1 { margin: 0 0 8px; font-size: 18px; }
+  .toolbar .count { font-size: 13px; opacity: 0.9; }
+  .toolbar button { background: #fff; color: #1976D2; border: none; padding: 12px 24px; border-radius: 6px; font-size: 15px; font-weight: 700; cursor: pointer; margin-top: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  .toolbar button:hover { background: #f0f0f0; }
+  .container { max-width: 1100px; margin: 16px auto; background: #fff; padding: 16px; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
+  .grid { display: grid; grid-template-columns: repeat(${cols}, 1fr); gap: 6px; }
+  .cell { text-align: center; padding: 6px; page-break-inside: avoid; border: 1px dashed #eee; border-radius: 4px; }
+  .cell img { width: 100%; max-width: ${px}px; height: auto; display: block; margin: 0 auto; }
+  .cell .code { font-family: 'Courier New', monospace; font-size: 9px; margin-top: 4px; color: #000; word-break: break-all; }
+  .cell .name { font-size: 8px; color: #666; margin-top: 2px; }
+  @media print {
+    .toolbar { display: none; }
+    body { background: #fff; padding: 0; }
+    .container { box-shadow: none; padding: 0; max-width: none; margin: 0; }
+    .cell { border: none; }
+    @page { margin: 1cm; }
+  }
+</style>
+</head><body>
+  <div class="toolbar">
+    <h1>📄 Кибер-Завхоз — печать кодов</h1>
+    <div class="count">${type === 'barcode' ? 'Штрихкоды' : 'QR-коды'} · ${items.length} шт. · размер ${size}</div>
+    <button onclick="window.print()">🖨 Печать / Сохранить PDF</button>
+  </div>
+  <div class="container">
+    <div class="grid">${cells}</div>
+  </div>
+</body></html>`;
+}
+
+async function buildItemsWithImages(items, type) {
+  return await Promise.all(items.map(async (item) => ({
+    ...item, img: await genCodeDataUrl(item.code, type),
+  })));
+}
+
+// HTML страница для печати существующих
+app.get('/api/export/print', async (req, res) => {
+  try {
+    const type = req.query.type === 'barcode' ? 'barcode' : 'qr';
+    const size = ['small', 'medium', 'large'].includes(req.query.size) ? req.query.size : 'small';
+    let items;
+    if (req.query.ids) {
+      const ids = req.query.ids.split(',').map(Number).filter(Boolean);
+      if (ids.length === 0) return res.status(400).send('Пустой список');
+      const placeholders = ids.map(() => '?').join(',');
+      const [rows] = await db.query(`SELECT code, name FROM items WHERE id IN (${placeholders}) ORDER BY name`, ids);
+      items = rows;
+    } else {
+      const [rows] = await db.query('SELECT code, name FROM items ORDER BY name');
+      items = rows;
+    }
+    if (items.length === 0) return res.status(404).send('Нет данных');
+    const withImages = await buildItemsWithImages(items, type);
+    const html = renderPrintHtml(withImages, type, size);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка генерации страницы');
+  }
+});
+
+// HTML страница для печати новых сгенерированных
+app.get('/api/export/print-generate', async (req, res) => {
+  try {
+    const count = Math.min(Math.max(parseInt(req.query.count) || 10, 1), 200);
+    const prefix = (req.query.prefix || 'ИНВ-').substring(0, 20);
+    const start = parseInt(req.query.start) || 1;
+    const pad = parseInt(req.query.pad) || 3;
+    const type = req.query.type === 'barcode' ? 'barcode' : 'qr';
+    const size = ['small', 'medium', 'large'].includes(req.query.size) ? req.query.size : 'small';
+
+    const items = [];
+    for (let i = 0; i < count; i++) {
+      const num = String(start + i).padStart(pad, '0');
+      items.push({ code: `${prefix}${num}`, name: '' });
+    }
+    const withImages = await buildItemsWithImages(items, type);
+    const html = renderPrintHtml(withImages, type, size);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('Ошибка генерации страницы');
+  }
+});
+
+// Экспорт существующих позиций (старый PDF — оставлен)
 app.get('/api/export/qr', async (req, res) => {
   try {
     const type = req.query.type === 'barcode' ? 'barcode' : 'qr';
@@ -393,63 +535,60 @@ app.get('/api/code/barcode/:code', async (req, res) => {
 });
 
 // === ПОЛЬЗОВАТЕЛИ (admin) ===
-app.get('/api/users', auth, async (req, res) => {
+const VALID_ROLES = ['viewer', 'editor', 'admin'];
+
+app.get('/api/users', auth, adminOnly, async (req, res) => {
   try {
-    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Нужны права администратора' });
-    const [rows] = await db.query('SELECT id, login, full_name, role, permissions, created_at FROM users');
-    const DEFAULT_PERMS = { can_add: true, can_edit: true, can_delete: false, can_export: true };
-    const result = rows.map(u => {
-      let perms = DEFAULT_PERMS;
-      if (u.permissions) {
-        try {
-          perms = typeof u.permissions === 'string' ? JSON.parse(u.permissions) : u.permissions;
-        } catch(e) { perms = DEFAULT_PERMS; }
-      }
-      return { ...u, permissions: perms };
-    });
-    res.json(result);
+    const [rows] = await db.query('SELECT id, login, full_name, role, created_at FROM users');
+    res.json(rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
 
-app.post('/api/users', auth, async (req, res) => {
+app.post('/api/users', auth, adminOnly, async (req, res) => {
   try {
-    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Нужны права администратора' });
-    const { login, password, full_name, role } = req.body;
+    const login = String(req.body.login || '').trim();
+    const password = String(req.body.password || '').trim();
+    const full_name = String(req.body.full_name || '').trim();
+    const role = VALID_ROLES.includes(req.body.role) ? req.body.role : 'editor';
+    if (!login || !password || !full_name) return res.status(400).json({ error: 'Все поля обязательны' });
+
     const [result] = await db.query(
       'INSERT INTO users (login, password, full_name, role) VALUES (?, ?, ?, ?)',
-      [login, password, full_name, role || 'user']
+      [login, password, full_name, role]
     );
-    res.json({ id: result.insertId, login, full_name, role: role || 'user' });
+    console.log(`[USERS] Создан: ${login} (${role})`);
+    res.json({ id: result.insertId, login, full_name, role });
   } catch (err) {
-    console.error(err);
+    console.error('[USERS] Create error:', err.message);
     if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: 'Логин уже занят' });
-    res.status(500).json({ error: 'Ошибка сервера' });
+    res.status(500).json({ error: err.message || 'Ошибка сервера' });
   }
 });
 
-app.put('/api/users/:id', auth, async (req, res) => {
+app.put('/api/users/:id', auth, adminOnly, async (req, res) => {
   try {
-    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Нужны права администратора' });
-    const { full_name, role, password } = req.body;
-    const perms = req.body.permissions ? JSON.stringify(req.body.permissions) : null;
+    const full_name = String(req.body.full_name || '').trim();
+    const role = VALID_ROLES.includes(req.body.role) ? req.body.role : 'editor';
+    const password = req.body.password ? String(req.body.password).trim() : null;
+
     if (password) {
-      await db.query('UPDATE users SET full_name=?, role=?, password=?, permissions=? WHERE id=?', [full_name, role, password, perms, req.params.id]);
+      await db.query('UPDATE users SET full_name=?, role=?, password=? WHERE id=?', [full_name, role, password, req.params.id]);
     } else {
-      await db.query('UPDATE users SET full_name=?, role=?, permissions=? WHERE id=?', [full_name, role, perms, req.params.id]);
+      await db.query('UPDATE users SET full_name=?, role=? WHERE id=?', [full_name, role, req.params.id]);
     }
+    console.log(`[USERS] Обновлён id=${req.params.id} role=${role}`);
     res.json({ success: true });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Ошибка сервера' });
+    console.error('[USERS] Update error:', err.message);
+    res.status(500).json({ error: err.message || 'Ошибка сервера' });
   }
 });
 
-app.delete('/api/users/:id', auth, async (req, res) => {
+app.delete('/api/users/:id', auth, adminOnly, async (req, res) => {
   try {
-    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Нужны права администратора' });
     await db.query('DELETE FROM users WHERE id = ?', [req.params.id]);
     res.json({ success: true });
   } catch (err) {
