@@ -34,8 +34,14 @@ function auth(req, res, next) {
   next();
 }
 
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, 'uploads/'),
+  destination: (req, file, cb) => {
+    if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    cb(null, UPLOADS_DIR);
+  },
   filename: (req, file, cb) => {
     const ext = path.extname(file.originalname) || '.jpg';
     cb(null, `item_${req.params.id}_${Date.now()}${ext}`);
@@ -196,60 +202,107 @@ app.get('/api/items/:id/history', auth, async (req, res) => {
   }
 });
 
-// === ЭКСПОРТ QR в PDF ===
-app.get('/api/export/qr', auth, async (req, res) => {
+// === ЭКСПОРТ В PDF (универсальный) ===
+async function generateCodeImage(code, type) {
+  if (type === 'barcode') {
+    return await bwipjs.toBuffer({
+      bcid: 'code128', text: code, scale: 2, height: 12,
+      includetext: false,
+    });
+  }
+  const dataUrl = await QRCode.toDataURL(code, { width: 200, margin: 1 });
+  return Buffer.from(dataUrl.split(',')[1], 'base64');
+}
+
+async function streamPdf(items, options, res) {
+  const { type = 'qr', size = 'small', showName = true } = options;
+  const sizeMap = { small: 60, medium: 100, large: 150 };
+  const codeW = sizeMap[size] || 60;
+  const codeH = type === 'barcode' ? codeW * 0.4 : codeW;
+
+  const doc = new PDFDocument({ margin: 20, size: 'A4' });
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename=${type}-codes.pdf`);
+  doc.pipe(res);
+
+  const margin = 20;
+  const pageW = doc.page.width - margin * 2;
+  const pageH = doc.page.height - margin * 2;
+  const cellW = codeW + 20;
+  const cellH = codeH + (showName ? 30 : 16);
+  const cols = Math.max(1, Math.floor(pageW / cellW));
+  const rows = Math.max(1, Math.floor(pageH / cellH));
+  const perPage = cols * rows;
+
+  for (let i = 0; i < items.length; i++) {
+    const idxOnPage = i % perPage;
+    if (i > 0 && idxOnPage === 0) doc.addPage();
+
+    const col = idxOnPage % cols;
+    const row = Math.floor(idxOnPage / cols);
+    const cellX = margin + col * cellW;
+    const cellY = margin + row * cellH;
+    const imgX = cellX + (cellW - codeW) / 2;
+    const imgY = cellY + 4;
+
+    try {
+      const buf = await generateCodeImage(items[i].code, type);
+      doc.image(buf, imgX, imgY, { width: codeW, height: codeH });
+    } catch (e) { console.error('img err', e.message); }
+
+    doc.fontSize(7).fillColor('#000').text(
+      items[i].code, cellX, imgY + codeH + 2, { width: cellW, align: 'center' }
+    );
+    if (showName && items[i].name) {
+      doc.fontSize(6).fillColor('#666').text(
+        items[i].name.substring(0, 28), cellX, imgY + codeH + 12, { width: cellW, align: 'center' }
+      );
+    }
+  }
+
+  doc.end();
+}
+
+// Экспорт существующих позиций
+app.get('/api/export/qr', async (req, res) => {
   try {
+    const type = req.query.type === 'barcode' ? 'barcode' : 'qr';
+    const size = ['small', 'medium', 'large'].includes(req.query.size) ? req.query.size : 'small';
     let items;
     if (req.query.ids) {
       const ids = req.query.ids.split(',').map(Number).filter(Boolean);
+      if (ids.length === 0) return res.status(400).json({ error: 'Пустой список' });
       const placeholders = ids.map(() => '?').join(',');
-      const [rows] = await db.query(`SELECT * FROM items WHERE id IN (${placeholders}) ORDER BY name`, ids);
+      const [rows] = await db.query(`SELECT code, name FROM items WHERE id IN (${placeholders}) ORDER BY name`, ids);
       items = rows;
     } else {
-      const [rows] = await db.query('SELECT * FROM items ORDER BY name');
+      const [rows] = await db.query('SELECT code, name FROM items ORDER BY name');
       items = rows;
     }
+    if (items.length === 0) return res.status(404).json({ error: 'Нет данных' });
+    await streamPdf(items, { type, size, showName: true }, res);
+  } catch (err) {
+    console.error(err);
+    if (!res.headersSent) res.status(500).json({ error: 'Ошибка генерации PDF' });
+  }
+});
 
-    const doc = new PDFDocument({ margin: 20, size: 'A4' });
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'attachment; filename=qr-codes.pdf');
-    doc.pipe(res);
+// Генерация новых пустых кодов
+app.get('/api/export/generate', async (req, res) => {
+  try {
+    const count = Math.min(Math.max(parseInt(req.query.count) || 10, 1), 200);
+    const prefix = (req.query.prefix || 'ИНВ-').substring(0, 20);
+    const start = parseInt(req.query.start) || 1;
+    const pad = parseInt(req.query.pad) || 3;
+    const type = req.query.type === 'barcode' ? 'barcode' : 'qr';
+    const size = ['small', 'medium', 'large'].includes(req.query.size) ? req.query.size : 'small';
 
-    const cols = 3;
-    const pageW = doc.page.width - 40;
-    const colW = pageW / cols;
-    const qrSize = 90;
-    const cellH = qrSize + 36;
-
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      const col = i % cols;
-      const row = Math.floor(i / cols);
-
-      if (i > 0 && col === 0) {
-        const nextY = 20 + row * cellH;
-        if (nextY + cellH > doc.page.height - 20) {
-          doc.addPage();
-        }
-      }
-
-      const pageRows = Math.floor((doc.y - 20) / cellH);
-      const curRow = row - pageRows;
-      const x = 20 + col * colW + (colW - qrSize) / 2;
-      const baseY = col === 0 && row > 0 ? doc.y : 20 + Math.floor(i / cols) * cellH;
-      const y = col === 0 ? (i === 0 ? 20 : doc.y + 10) : (doc.y > 20 ? doc.y : 20);
-
-      try {
-        const qrDataUrl = await QRCode.toDataURL(item.code, { width: qrSize, margin: 1 });
-        const buf = Buffer.from(qrDataUrl.split(',')[1], 'base64');
-        doc.image(buf, x, col === 0 ? (i === 0 ? 20 : undefined) : undefined, { width: qrSize });
-      } catch(e) {}
-
-      doc.fontSize(7).fillColor('#333').text(item.code, 20 + col * colW, undefined, { width: colW, align: 'center' });
-      doc.fontSize(6).fillColor('#666').text(item.name.substring(0, 30), 20 + col * colW, undefined, { width: colW, align: 'center' });
+    const items = [];
+    for (let i = 0; i < count; i++) {
+      const num = String(start + i).padStart(pad, '0');
+      items.push({ code: `${prefix}${num}`, name: '' });
     }
-
-    doc.end();
+    await streamPdf(items, { type, size, showName: false }, res);
   } catch (err) {
     console.error(err);
     if (!res.headersSent) res.status(500).json({ error: 'Ошибка генерации PDF' });
@@ -274,8 +327,8 @@ app.post('/api/items/:id/photo', auth, upload.single('photo'), async (req, res) 
   }
 });
 
-// === КОДЫ ===
-app.get('/api/items/:id/qr', auth, async (req, res) => {
+// === КОДЫ === (без auth — только генерируют картинки по коду из БД)
+app.get('/api/items/:id/qr', async (req, res) => {
   try {
     const [rows] = await db.query('SELECT code FROM items WHERE id = ?', [req.params.id]);
     if (rows.length === 0) return res.status(404).json({ error: 'Не найдено' });
@@ -288,17 +341,13 @@ app.get('/api/items/:id/qr', auth, async (req, res) => {
   }
 });
 
-app.get('/api/items/:id/barcode', auth, async (req, res) => {
+app.get('/api/items/:id/barcode', async (req, res) => {
   try {
     const [rows] = await db.query('SELECT code FROM items WHERE id = ?', [req.params.id]);
     if (rows.length === 0) return res.status(404).json({ error: 'Не найдено' });
     const buffer = await bwipjs.toBuffer({
-      bcid: 'code128',
-      text: rows[0].code,
-      scale: 3,
-      height: 15,
-      includetext: true,
-      textxalign: 'center'
+      bcid: 'code128', text: rows[0].code, scale: 3, height: 15,
+      includetext: true, textxalign: 'center'
     });
     res.set('Content-Type', 'image/png');
     res.send(buffer);
@@ -306,6 +355,26 @@ app.get('/api/items/:id/barcode', auth, async (req, res) => {
     console.error(err);
     res.status(500).json({ error: 'Ошибка генерации штрихкода' });
   }
+});
+
+// === ГЕНЕРАЦИЯ ОТДЕЛЬНОГО QR/ШТРИХКОДА ПО КОДУ (для preview) ===
+app.get('/api/code/qr/:code', async (req, res) => {
+  try {
+    const buffer = await QRCode.toBuffer(req.params.code, { width: 400, margin: 2 });
+    res.set('Content-Type', 'image/png');
+    res.send(buffer);
+  } catch (e) { res.status(500).end(); }
+});
+
+app.get('/api/code/barcode/:code', async (req, res) => {
+  try {
+    const buffer = await bwipjs.toBuffer({
+      bcid: 'code128', text: req.params.code, scale: 3, height: 15,
+      includetext: true, textxalign: 'center'
+    });
+    res.set('Content-Type', 'image/png');
+    res.send(buffer);
+  } catch (e) { res.status(500).end(); }
 });
 
 // === ПОЛЬЗОВАТЕЛИ (admin) ===
