@@ -19,10 +19,24 @@ const DB_CONFIG = {
 };
 
 app.use(cors());
-app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use(express.json({ limit: '20mb' }));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads'), {
+  maxAge: '7d', // фотки кэшируем
+  immutable: true,
+}));
+
+// Все API-ответы — без кэша (актуальные данные)
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
 
 const tokens = new Map();
+// Кэш QR/штрихкодов в памяти — переиспользуем данные
+const codeCache = new Map();
+const CODE_CACHE_MAX = 2000;
 
 function auth(req, res, next) {
   const header = req.headers.authorization;
@@ -194,8 +208,13 @@ app.put('/api/items/:id', auth, canEdit, async (req, res) => {
 
 app.delete('/api/items/:id', auth, adminOnly, async (req, res) => {
   try {
-    const [rows] = await db.query('SELECT name, code FROM items WHERE id = ?', [req.params.id]);
+    const [rows] = await db.query('SELECT name, code, photo FROM items WHERE id = ?', [req.params.id]);
     await db.query('DELETE FROM items WHERE id = ?', [req.params.id]);
+    // Удаляем файл фото с диска если есть
+    if (rows[0]?.photo) {
+      const filePath = path.join(UPLOADS_DIR, rows[0].photo);
+      try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (e) { console.error('photo del', e.message); }
+    }
     if (rows[0]) await logHistory(req.params.id, req.user.login, 'delete', 'Удалено', { name: rows[0].name });
     res.json({ success: true });
   } catch (err) {
@@ -227,6 +246,31 @@ async function generateCodeImage(code, type) {
   }
   const dataUrl = await QRCode.toDataURL(code, { width: 200, margin: 1 });
   return Buffer.from(dataUrl.split(',')[1], 'base64');
+}
+
+// Кэшированная генерация data URL для HTML страниц печати
+async function genCodeDataUrlCached(code, type) {
+  const key = `${type}:${code}`;
+  if (codeCache.has(key)) return codeCache.get(key);
+
+  let dataUrl;
+  if (type === 'barcode') {
+    const buf = await bwipjs.toBuffer({
+      bcid: 'code128', text: code, scale: 3, height: 12,
+      includetext: false, paddingwidth: 5,
+    });
+    dataUrl = `data:image/png;base64,${buf.toString('base64')}`;
+  } else {
+    dataUrl = await QRCode.toDataURL(code, { width: 180, margin: 1 });
+  }
+
+  codeCache.set(key, dataUrl);
+  // LRU-обрезание
+  if (codeCache.size > CODE_CACHE_MAX) {
+    const firstKey = codeCache.keys().next().value;
+    codeCache.delete(firstKey);
+  }
+  return dataUrl;
 }
 
 async function streamPdf(items, options, res) {
@@ -283,14 +327,7 @@ const SIZE_PX = { small: 90, medium: 140, large: 200 };
 const SIZE_COLS = { small: 5, medium: 4, large: 3 };
 
 async function genCodeDataUrl(code, type) {
-  if (type === 'barcode') {
-    const buf = await bwipjs.toBuffer({
-      bcid: 'code128', text: code, scale: 3, height: 12,
-      includetext: false, paddingwidth: 5,
-    });
-    return `data:image/png;base64,${buf.toString('base64')}`;
-  }
-  return await QRCode.toDataURL(code, { width: 300, margin: 1 });
+  return genCodeDataUrlCached(code, type);
 }
 
 function escapeHtml(s) {
@@ -402,6 +439,171 @@ app.get('/api/export/print-generate', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).send('Ошибка генерации страницы');
+  }
+});
+
+// === ОТЧЁТ ИНВЕНТАРИЗАЦИИ ===
+// In-memory хранилище отчётов (для случаев когда foundIds/missingIds большие)
+const inventoryReports = new Map();
+const INVENTORY_REPORT_TTL = 30 * 60 * 1000; // 30 минут
+
+// POST: сохранить данные отчёта, получить ID
+app.post('/api/inventory-report', auth, async (req, res) => {
+  try {
+    const { foundIds = [], missingIds = [], conductedBy } = req.body;
+    const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    inventoryReports.set(id, {
+      foundIds: foundIds.map(Number).filter(Boolean),
+      missingIds: missingIds.map(Number).filter(Boolean),
+      conductedBy: conductedBy || req.user.full_name || req.user.login,
+      conductedAt: new Date().toISOString(),
+      expiresAt: Date.now() + INVENTORY_REPORT_TTL,
+    });
+    // Очистка просроченных
+    for (const [k, v] of inventoryReports.entries()) {
+      if (v.expiresAt < Date.now()) inventoryReports.delete(k);
+    }
+    res.json({ id, url: `/api/inventory-report/${id}` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Ошибка создания отчёта' });
+  }
+});
+
+// GET: HTML страница отчёта (без auth — открывается в браузере)
+app.get('/api/inventory-report/:id', async (req, res) => {
+  try {
+    const report = inventoryReports.get(req.params.id);
+    if (!report) {
+      return res.status(404).send('<h1>Отчёт не найден или устарел</h1><p>Сформируйте новый отчёт в приложении.</p>');
+    }
+
+    const allIds = [...report.foundIds, ...report.missingIds];
+    let foundItems = [], missingItems = [];
+    if (allIds.length > 0) {
+      const placeholders = allIds.map(() => '?').join(',');
+      const [rows] = await db.query(
+        `SELECT id, code, name, category, location, responsible, status FROM items WHERE id IN (${placeholders})`,
+        allIds
+      );
+      const byId = new Map(rows.map(r => [r.id, r]));
+      foundItems = report.foundIds.map(id => byId.get(id)).filter(Boolean);
+      missingItems = report.missingIds.map(id => byId.get(id)).filter(Boolean);
+    }
+
+    const total = foundItems.length + missingItems.length;
+    const foundPct = total > 0 ? Math.round((foundItems.length / total) * 100) : 0;
+    const date = new Date(report.conductedAt);
+    const dateStr = date.toLocaleDateString('ru-RU') + ' ' + date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+
+    const renderRow = (it, status) => `
+      <tr class="${status}">
+        <td class="code">${escapeHtml(it.code)}</td>
+        <td>${escapeHtml(it.name)}</td>
+        <td>${escapeHtml(it.location || '—')}</td>
+        <td>${escapeHtml(it.responsible || '—')}</td>
+        <td class="status-cell">${status === 'found' ? '✅ Найдено' : '❌ Не найдено'}</td>
+      </tr>`;
+
+    const html = `<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Акт инвентаризации</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: 'Times New Roman', serif; margin: 0; padding: 20px; background: #f5f5f5; color: #000; }
+  .container { max-width: 900px; margin: 0 auto; background: #fff; padding: 30px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
+  h1 { text-align: center; margin: 0 0 8px; font-size: 22px; }
+  .subtitle { text-align: center; color: #666; margin-bottom: 24px; font-size: 13px; }
+  .meta { background: #f9f9f9; padding: 14px 16px; border-radius: 4px; margin-bottom: 20px; font-size: 13px; }
+  .meta div { margin: 3px 0; }
+  .meta b { display: inline-block; min-width: 180px; }
+  .stats { display: flex; gap: 10px; margin-bottom: 24px; }
+  .stat-box { flex: 1; padding: 14px; border-radius: 6px; text-align: center; }
+  .stat-total { background: #E3F2FD; }
+  .stat-found { background: #E8F5E9; }
+  .stat-missing { background: #FFEBEE; }
+  .stat-num { font-size: 26px; font-weight: 700; }
+  .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 4px; color: #555; }
+  h2 { font-size: 15px; margin: 24px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #ddd; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid #eee; vertical-align: top; }
+  th { background: #f0f0f0; font-weight: 700; font-size: 11px; }
+  td.code { font-family: 'Courier New', monospace; font-size: 11px; white-space: nowrap; }
+  tr.missing { background: #fff5f5; }
+  tr.found td.status-cell { color: #2E7D32; font-weight: 600; }
+  tr.missing td.status-cell { color: #C62828; font-weight: 600; }
+  .signatures { margin-top: 50px; display: flex; justify-content: space-around; gap: 40px; }
+  .sign-block { flex: 1; text-align: center; }
+  .sign-line { border-top: 1px solid #000; margin-top: 50px; padding-top: 5px; font-size: 11px; }
+  .toolbar { background: #1976D2; color: #fff; padding: 14px 16px; position: sticky; top: 0; z-index: 10; max-width: 900px; margin: 0 auto 14px; }
+  .toolbar button { background: #fff; color: #1976D2; border: none; padding: 10px 20px; border-radius: 4px; font-size: 14px; font-weight: 700; cursor: pointer; }
+  @media print {
+    body { background: #fff; padding: 0; }
+    .container { box-shadow: none; padding: 0; max-width: none; }
+    .toolbar { display: none; }
+    @page { margin: 1.5cm; }
+  }
+</style>
+</head><body>
+  <div class="toolbar">
+    <button onclick="window.print()">🖨 Печать / Сохранить PDF</button>
+    <span style="margin-left: 12px; opacity: 0.9; font-size: 13px;">Акт инвентаризации</span>
+  </div>
+  <div class="container">
+    <h1>АКТ ИНВЕНТАРИЗАЦИИ</h1>
+    <div class="subtitle">проведения сверки наличия имущества</div>
+
+    <div class="meta">
+      <div><b>Дата проведения:</b> ${dateStr}</div>
+      <div><b>Ответственный:</b> ${escapeHtml(report.conductedBy)}</div>
+      <div><b>Всего позиций в учёте:</b> ${total}</div>
+    </div>
+
+    <div class="stats">
+      <div class="stat-box stat-total">
+        <div class="stat-num">${total}</div>
+        <div class="stat-label">Всего</div>
+      </div>
+      <div class="stat-box stat-found">
+        <div class="stat-num" style="color: #2E7D32">${foundItems.length}</div>
+        <div class="stat-label">Найдено (${foundPct}%)</div>
+      </div>
+      <div class="stat-box stat-missing">
+        <div class="stat-num" style="color: #C62828">${missingItems.length}</div>
+        <div class="stat-label">Не найдено</div>
+      </div>
+    </div>
+
+    ${missingItems.length > 0 ? `
+    <h2>❌ Не найдено при проверке (${missingItems.length})</h2>
+    <table>
+      <thead><tr><th>Код</th><th>Наименование</th><th>Местонахождение</th><th>Ответственный</th><th>Статус</th></tr></thead>
+      <tbody>${missingItems.map(it => renderRow(it, 'missing')).join('')}</tbody>
+    </table>
+    ` : ''}
+
+    ${foundItems.length > 0 ? `
+    <h2>✅ Найдено и подтверждено (${foundItems.length})</h2>
+    <table>
+      <thead><tr><th>Код</th><th>Наименование</th><th>Местонахождение</th><th>Ответственный</th><th>Статус</th></tr></thead>
+      <tbody>${foundItems.map(it => renderRow(it, 'found')).join('')}</tbody>
+    </table>
+    ` : ''}
+
+    <div class="signatures">
+      <div class="sign-block"><div class="sign-line">Лицо, проводившее инвентаризацию</div></div>
+      <div class="sign-block"><div class="sign-line">Материально-ответственное лицо</div></div>
+    </div>
+  </div>
+</body></html>`;
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send('<h1>Ошибка генерации отчёта</h1>');
   }
 });
 
