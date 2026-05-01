@@ -499,10 +499,9 @@ app.get('/api/inventory-report/:id', async (req, res) => {
     const renderRow = (it, status) => `
       <tr class="${status}">
         <td class="code">${escapeHtml(it.code)}</td>
-        <td>${escapeHtml(it.name)}</td>
-        <td>${escapeHtml(it.location || '—')}</td>
-        <td>${escapeHtml(it.responsible || '—')}</td>
-        <td class="status-cell">${status === 'found' ? '✅ Найдено' : '❌ Не найдено'}</td>
+        <td class="name">${escapeHtml(it.name)}</td>
+        <td class="loc">${escapeHtml(it.location || '—')}</td>
+        <td class="resp">${escapeHtml(it.responsible || '—')}</td>
       </tr>`;
 
     const html = `<!DOCTYPE html>
@@ -512,33 +511,60 @@ app.get('/api/inventory-report/:id', async (req, res) => {
 <title>Акт инвентаризации</title>
 <style>
   * { box-sizing: border-box; }
-  body { font-family: 'Times New Roman', serif; margin: 0; padding: 20px; background: #f5f5f5; color: #000; }
-  .container { max-width: 900px; margin: 0 auto; background: #fff; padding: 30px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
-  h1 { text-align: center; margin: 0 0 8px; font-size: 22px; }
-  .subtitle { text-align: center; color: #666; margin-bottom: 24px; font-size: 13px; }
-  .meta { background: #f9f9f9; padding: 14px 16px; border-radius: 4px; margin-bottom: 20px; font-size: 13px; }
-  .meta div { margin: 3px 0; }
-  .meta b { display: inline-block; min-width: 180px; }
-  .stats { display: flex; gap: 10px; margin-bottom: 24px; }
-  .stat-box { flex: 1; padding: 14px; border-radius: 6px; text-align: center; }
+  html, body { margin: 0; padding: 0; }
+  body { font-family: 'Times New Roman', serif; padding: 12px; background: #f5f5f5; color: #000; }
+  .container { max-width: 900px; margin: 0 auto; background: #fff; padding: 24px 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
+  h1 { text-align: center; margin: 0 0 6px; font-size: 20px; }
+  .subtitle { text-align: center; color: #666; margin-bottom: 20px; font-size: 13px; }
+  .meta { background: #f9f9f9; padding: 12px 14px; border-radius: 4px; margin-bottom: 18px; font-size: 13px; }
+  .meta-row { display: flex; flex-wrap: wrap; margin: 4px 0; }
+  .meta-label { font-weight: 700; min-width: 170px; flex-shrink: 0; }
+  .meta-value { flex: 1; word-break: break-word; }
+  .stats { display: flex; gap: 8px; margin-bottom: 20px; }
+  .stat-box { flex: 1; padding: 12px 8px; border-radius: 6px; text-align: center; min-width: 0; }
   .stat-total { background: #E3F2FD; }
   .stat-found { background: #E8F5E9; }
   .stat-missing { background: #FFEBEE; }
-  .stat-num { font-size: 26px; font-weight: 700; }
-  .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 4px; color: #555; }
-  h2 { font-size: 15px; margin: 24px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #ddd; }
-  table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid #eee; vertical-align: top; }
-  th { background: #f0f0f0; font-weight: 700; font-size: 11px; }
-  td.code { font-family: 'Courier New', monospace; font-size: 11px; white-space: nowrap; }
+  .stat-num { font-size: 24px; font-weight: 700; }
+  .stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.3px; margin-top: 4px; color: #555; }
+  h2 { font-size: 14px; margin: 20px 0 6px; padding-bottom: 4px; border-bottom: 1px solid #ddd; }
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; border-collapse: collapse; font-size: 11px; table-layout: fixed; }
+  th, td { padding: 5px 6px; text-align: left; border-bottom: 1px solid #eee; vertical-align: top; word-wrap: break-word; word-break: break-word; }
+  th { background: #f0f0f0; font-weight: 700; font-size: 10px; }
+  td.code { font-family: 'Courier New', monospace; font-size: 10px; }
+  td.name { font-weight: 600; }
+  col.col-code { width: 22%; }
+  col.col-name { width: 38%; }
+  col.col-loc { width: 22%; }
+  col.col-resp { width: 18%; }
   tr.missing { background: #fff5f5; }
-  tr.found td.status-cell { color: #2E7D32; font-weight: 600; }
-  tr.missing td.status-cell { color: #C62828; font-weight: 600; }
-  .signatures { margin-top: 50px; display: flex; justify-content: space-around; gap: 40px; }
-  .sign-block { flex: 1; text-align: center; }
-  .sign-line { border-top: 1px solid #000; margin-top: 50px; padding-top: 5px; font-size: 11px; }
-  .toolbar { background: #1976D2; color: #fff; padding: 14px 16px; position: sticky; top: 0; z-index: 10; max-width: 900px; margin: 0 auto 14px; }
-  .toolbar button { background: #fff; color: #1976D2; border: none; padding: 10px 20px; border-radius: 4px; font-size: 14px; font-weight: 700; cursor: pointer; }
+  tr.missing td.code { color: #C62828; }
+  tr.found td.code { color: #2E7D32; }
+  .signatures { margin-top: 40px; display: flex; flex-wrap: wrap; gap: 24px; }
+  .sign-block { flex: 1; min-width: 220px; text-align: center; }
+  .sign-line { border-top: 1px solid #000; margin-top: 40px; padding-top: 4px; font-size: 11px; }
+  .toolbar { background: #1976D2; color: #fff; padding: 12px 14px; position: sticky; top: 0; z-index: 10; max-width: 900px; margin: 0 auto 12px; display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+  .toolbar button { background: #fff; color: #1976D2; border: none; padding: 9px 18px; border-radius: 4px; font-size: 14px; font-weight: 700; cursor: pointer; }
+  .toolbar .lbl { opacity: 0.95; font-size: 13px; }
+
+  @media (max-width: 600px) {
+    body { padding: 6px; font-size: 13px; }
+    .container { padding: 16px 12px; }
+    h1 { font-size: 17px; }
+    .meta { font-size: 12px; }
+    .meta-label { min-width: 100%; }
+    .stats { gap: 6px; }
+    .stat-num { font-size: 20px; }
+    .stat-label { font-size: 9px; }
+    table { font-size: 10px; }
+    th, td { padding: 4px 5px; }
+    col.col-code { width: 26%; }
+    col.col-name { width: 38%; }
+    col.col-loc { width: 22%; }
+    col.col-resp { width: 14%; }
+  }
+
   @media print {
     body { background: #fff; padding: 0; }
     .container { box-shadow: none; padding: 0; max-width: none; }
@@ -549,16 +575,16 @@ app.get('/api/inventory-report/:id', async (req, res) => {
 </head><body>
   <div class="toolbar">
     <button onclick="window.print()">🖨 Печать / Сохранить PDF</button>
-    <span style="margin-left: 12px; opacity: 0.9; font-size: 13px;">Акт инвентаризации</span>
+    <span class="lbl">Акт инвентаризации</span>
   </div>
   <div class="container">
     <h1>АКТ ИНВЕНТАРИЗАЦИИ</h1>
     <div class="subtitle">проведения сверки наличия имущества</div>
 
     <div class="meta">
-      <div><b>Дата проведения:</b> ${dateStr}</div>
-      <div><b>Ответственный:</b> ${escapeHtml(report.conductedBy)}</div>
-      <div><b>Всего позиций в учёте:</b> ${total}</div>
+      <div class="meta-row"><span class="meta-label">Дата проведения:</span><span class="meta-value">${dateStr}</span></div>
+      <div class="meta-row"><span class="meta-label">Ответственное лицо (ФИО):</span><span class="meta-value">${escapeHtml(report.conductedBy)}</span></div>
+      <div class="meta-row"><span class="meta-label">Всего позиций в учёте:</span><span class="meta-value">${total}</span></div>
     </div>
 
     <div class="stats">
@@ -578,18 +604,20 @@ app.get('/api/inventory-report/:id', async (req, res) => {
 
     ${missingItems.length > 0 ? `
     <h2>❌ Не найдено при проверке (${missingItems.length})</h2>
-    <table>
-      <thead><tr><th>Код</th><th>Наименование</th><th>Местонахождение</th><th>Ответственный</th><th>Статус</th></tr></thead>
+    <div class="table-wrap"><table>
+      <colgroup><col class="col-code"><col class="col-name"><col class="col-loc"><col class="col-resp"></colgroup>
+      <thead><tr><th>Код</th><th>Наименование</th><th>Местонахождение</th><th>Ответственный</th></tr></thead>
       <tbody>${missingItems.map(it => renderRow(it, 'missing')).join('')}</tbody>
-    </table>
+    </table></div>
     ` : ''}
 
     ${foundItems.length > 0 ? `
     <h2>✅ Найдено и подтверждено (${foundItems.length})</h2>
-    <table>
-      <thead><tr><th>Код</th><th>Наименование</th><th>Местонахождение</th><th>Ответственный</th><th>Статус</th></tr></thead>
+    <div class="table-wrap"><table>
+      <colgroup><col class="col-code"><col class="col-name"><col class="col-loc"><col class="col-resp"></colgroup>
+      <thead><tr><th>Код</th><th>Наименование</th><th>Местонахождение</th><th>Ответственный</th></tr></thead>
       <tbody>${foundItems.map(it => renderRow(it, 'found')).join('')}</tbody>
-    </table>
+    </table></div>
     ` : ''}
 
     <div class="signatures">
