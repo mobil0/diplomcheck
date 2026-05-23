@@ -690,7 +690,7 @@ app.get('/api/inventory-report/:id', async (req, res) => {
   <div class="toolbar">
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <button onclick="window.print()">🖨 Печать</button>
-      <button onclick="window.location.href=location.href.replace('/inventory-report/','/inventory-report/pdf/')" style="background:#388E3C;color:#fff;border:none;padding:9px 18px;border-radius:4px;font-size:14px;font-weight:700;cursor:pointer">📥 Скачать PDF</button>
+      <button onclick="window.location.href=location.href.replace('/api/inventory-report/','/api/inventory-pdf/')" style="background:#388E3C;color:#fff;border:none;padding:9px 18px;border-radius:4px;font-size:14px;font-weight:700;cursor:pointer">📥 Скачать PDF</button>
       <span class="lbl">Акт инвентаризации</span>
     </div>
   </div>
@@ -753,7 +753,7 @@ app.get('/api/inventory-report/:id', async (req, res) => {
 });
 
 // PDF акта инвентаризации
-app.get('/api/inventory-report/pdf/:id', async (req, res) => {
+app.get('/api/inventory-pdf/:id', async (req, res) => {
   try {
     const report = inventoryReports.get(req.params.id);
     if (!report) return res.status(404).send('Отчёт не найден или устарел');
