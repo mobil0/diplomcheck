@@ -384,26 +384,29 @@ function renderPrintHtml(items, type, size) {
   <div class="toolbar">
     <h1>📄 Кибер-Завхоз — печать кодов</h1>
     <div class="count">${type === 'barcode' ? 'Штрихкоды' : 'QR-коды'} · ${items.length} шт. · размер ${size}</div>
-    <button id="printBtn" onclick="doPrint()" disabled style="opacity:0.5">⏳ Загрузка...</button>
-    <div class="hint">
-      Android: «Печать» → смените принтер на <b>«Сохранить как PDF»</b><br>
-      iOS: «Печать» → раздвиньте пальцы на превью → «Поделиться» → «Сохранить в Файлы»
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
+      <button id="printBtn" onclick="window.print()" disabled style="opacity:0.5">⏳ Загрузка...</button>
+      <button id="pdfBtn" onclick="downloadPdf()" disabled style="opacity:0.5;background:#388E3C;color:#fff;border:none;padding:10px 22px;border-radius:6px;font-size:15px;font-weight:700;cursor:pointer">⏳ PDF...</button>
     </div>
   </div>
   <div class="container">
     <div class="grid">${cells}</div>
   </div>
 <script>
-  function doPrint() { window.print(); }
+  function downloadPdf() {
+    var url = location.href.replace('/export/print', '/export/pdf').replace('/export/print-generate', '/export/pdf');
+    // для print-generate коды передаём через codes=
+    window.location.href = url;
+  }
   var imgs = document.querySelectorAll('img');
   var total = imgs.length, loaded = 0;
   function onLoad() {
     loaded++;
     if (loaded >= total) {
-      var btn = document.getElementById('printBtn');
-      btn.disabled = false;
-      btn.style.opacity = '1';
-      btn.textContent = '🖨 Печать / Сохранить PDF';
+      var pb = document.getElementById('printBtn');
+      var db = document.getElementById('pdfBtn');
+      pb.disabled = false; pb.style.opacity = '1'; pb.textContent = '🖨 Печать';
+      db.disabled = false; db.style.opacity = '1'; db.textContent = '📥 Скачать PDF';
     }
   }
   if (total === 0) { onLoad(); }
@@ -476,6 +479,80 @@ app.get('/api/export/print-generate', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).send('Ошибка генерации страницы');
+  }
+});
+
+// === PDF ЭКСПОРТ (скачивание файла) ===
+const PDF_COLS = { small: 5, medium: 4, large: 3 };
+const PAGE_W = 595.28, PAGE_H = 841.89, PDF_MARGIN = 30;
+
+app.get('/api/export/pdf', async (req, res) => {
+  try {
+    const type = req.query.type === 'barcode' ? 'barcode' : 'qr';
+    const size = ['small', 'medium', 'large'].includes(req.query.size) ? req.query.size : 'small';
+    const cols = PDF_COLS[size] || 5;
+
+    let items;
+    if (req.query.ids) {
+      const ids = req.query.ids.split(',').map(Number).filter(Boolean);
+      if (ids.length === 0) return res.status(400).send('Пустой список');
+      const placeholders = ids.map(() => '?').join(',');
+      const [rows] = await db.query(`SELECT id, code, name FROM items WHERE id IN (${placeholders}) ORDER BY name`, ids);
+      items = rows;
+    } else if (req.query.codes) {
+      // для сгенерированных кодов
+      items = req.query.codes.split(',').map(c => ({ code: c, name: '' }));
+    } else {
+      const [rows] = await db.query('SELECT id, code, name FROM items ORDER BY name');
+      items = rows;
+    }
+    if (!items || items.length === 0) return res.status(404).send('Нет данных');
+
+    const usableW = PAGE_W - PDF_MARGIN * 2;
+    const cellW = usableW / cols;
+    const imgW = type === 'barcode' ? cellW * 0.9 : cellW * 0.75;
+    const imgH = type === 'barcode' ? imgW * 0.4 : imgW;
+    const textH = 20;
+    const cellH = imgH + textH + 8;
+
+    const doc = new PDFDocument({ size: 'A4', margin: 0, autoFirstPage: true });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="kiber-zavhoz-codes.pdf"`);
+    doc.pipe(res);
+
+    let col = 0, row = 0;
+    const maxRows = Math.floor((PAGE_H - PDF_MARGIN * 2) / cellH);
+
+    for (const item of items) {
+      if (row >= maxRows) {
+        doc.addPage();
+        col = 0; row = 0;
+      }
+      const x = PDF_MARGIN + col * cellW;
+      const y = PDF_MARGIN + row * cellH;
+
+      try {
+        const buf = await generateCodeImage(item.code, type);
+        const imgX = x + (cellW - imgW) / 2;
+        doc.image(buf, imgX, y, { width: imgW, height: imgH });
+      } catch (e) { /* пропускаем если ошибка генерации */ }
+
+      doc.fontSize(7).fillColor('#000')
+        .text(item.code, x, y + imgH + 2, { width: cellW, align: 'center', lineBreak: false });
+
+      if (item.name) {
+        doc.fontSize(6).fillColor('#444')
+          .text(item.name.substring(0, 32), x, y + imgH + 11, { width: cellW, align: 'center', lineBreak: false });
+      }
+
+      col++;
+      if (col >= cols) { col = 0; row++; }
+    }
+
+    doc.end();
+  } catch (err) {
+    console.error('PDF error:', err);
+    if (!res.headersSent) res.status(500).send('Ошибка генерации PDF');
   }
 });
 
@@ -611,8 +688,11 @@ app.get('/api/inventory-report/:id', async (req, res) => {
 </style>
 </head><body>
   <div class="toolbar">
-    <button onclick="window.print()">🖨 Печать / Сохранить PDF</button>
-    <span class="lbl">Акт инвентаризации</span>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button onclick="window.print()">🖨 Печать</button>
+      <button onclick="window.location.href=location.href.replace('/inventory-report/','/inventory-report/pdf/')" style="background:#388E3C;color:#fff;border:none;padding:9px 18px;border-radius:4px;font-size:14px;font-weight:700;cursor:pointer">📥 Скачать PDF</button>
+      <span class="lbl">Акт инвентаризации</span>
+    </div>
   </div>
   <div class="container">
     <h1>АКТ ИНВЕНТАРИЗАЦИИ</h1>
@@ -669,6 +749,70 @@ app.get('/api/inventory-report/:id', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).send('<h1>Ошибка генерации отчёта</h1>');
+  }
+});
+
+// PDF акта инвентаризации
+app.get('/api/inventory-report/pdf/:id', async (req, res) => {
+  try {
+    const report = inventoryReports.get(req.params.id);
+    if (!report) return res.status(404).send('Отчёт не найден или устарел');
+
+    const allIds = [...report.foundIds, ...report.missingIds];
+    let foundItems = [], missingItems = [];
+    if (allIds.length > 0) {
+      const placeholders = allIds.map(() => '?').join(',');
+      const [rows] = await db.query(
+        `SELECT id, code, name, location, responsible FROM items WHERE id IN (${placeholders})`, allIds
+      );
+      const byId = new Map(rows.map(r => [r.id, r]));
+      foundItems = report.foundIds.map(id => byId.get(id)).filter(Boolean);
+      missingItems = report.missingIds.map(id => byId.get(id)).filter(Boolean);
+    }
+
+    const doc = new PDFDocument({ size: 'A4', margin: 40 });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="inventory-report.pdf"`);
+    doc.pipe(res);
+
+    const date = new Date(report.conductedAt);
+    const dateStr = date.toLocaleDateString('ru-RU') + ' ' + date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    const total = foundItems.length + missingItems.length;
+    const foundPct = total > 0 ? Math.round((foundItems.length / total) * 100) : 0;
+
+    // Заголовок
+    doc.registerFont('Regular', 'node_modules/pdfkit/js/data/Helvetica.afm');
+    doc.fontSize(16).text('АКТ ИНВЕНТАРИЗАЦИИ', { align: 'center' });
+    doc.fontSize(11).text('Система учёта имущества «Кибер-Завхоз»', { align: 'center' });
+    doc.moveDown();
+    doc.fontSize(10)
+      .text(`Дата проведения: ${dateStr}`)
+      .text(`Провёл: ${report.conductedBy}`)
+      .text(`Всего позиций: ${total} | Найдено: ${foundItems.length} (${foundPct}%) | Не найдено: ${missingItems.length}`);
+    doc.moveDown();
+
+    const drawTable = (title, items, color) => {
+      doc.fontSize(12).fillColor(color).text(title);
+      doc.fillColor('#000').fontSize(9);
+      items.forEach((it, i) => {
+        if (doc.y > 750) doc.addPage();
+        doc.text(`${i + 1}. [${it.code}] ${it.name}${it.location ? ' — ' + it.location : ''}`, { indent: 10 });
+      });
+      doc.moveDown(0.5);
+    };
+
+    if (foundItems.length > 0) drawTable(`✓ Найдено (${foundItems.length}):`, foundItems, '#2E7D32');
+    if (missingItems.length > 0) drawTable(`✗ Не найдено (${missingItems.length}):`, missingItems, '#C62828');
+
+    doc.moveDown(2);
+    doc.fontSize(10).fillColor('#000').text('Подписи:');
+    doc.moveDown(1);
+    doc.text('Комиссия: ________________________     ________________________     ________________________');
+
+    doc.end();
+  } catch (err) {
+    console.error('Inventory PDF error:', err);
+    if (!res.headersSent) res.status(500).send('Ошибка генерации PDF');
   }
 });
 
