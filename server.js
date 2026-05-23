@@ -336,12 +336,15 @@ function escapeHtml(s) {
 
 function renderPrintHtml(items, type, size) {
   const px = SIZE_PX[size] || 90;
+  const cellH = type === 'barcode' ? Math.round(px * 0.45) : px;
   const cols = SIZE_COLS[size] || 5;
   const cells = items.map(item => `
     <div class="cell">
-      <img src="${item.img}" />
+      <div class="img-wrap">
+        <img src="${item.img}" width="${px}" height="${cellH}" />
+      </div>
       <div class="code">${escapeHtml(item.code)}</div>
-      ${item.name ? `<div class="name">${escapeHtml(item.name.substring(0, 28))}</div>` : ''}
+      ${item.name ? `<div class="name">${escapeHtml(item.name.substring(0, 30))}</div>` : ''}
     </div>
   `).join('');
 
@@ -352,24 +355,29 @@ function renderPrintHtml(items, type, size) {
 <title>Печать кодов — ${items.length} шт.</title>
 <style>
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; background: #f5f5f5; padding: 0; }
+  body { font-family: -apple-system, system-ui, sans-serif; margin: 0; background: #f5f5f5; padding: 0;
+         -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .toolbar { background: #1976D2; color: #fff; padding: 16px; position: sticky; top: 0; z-index: 10; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
-  .toolbar h1 { margin: 0 0 8px; font-size: 18px; }
-  .toolbar .count { font-size: 13px; opacity: 0.9; }
-  .toolbar button { background: #fff; color: #1976D2; border: none; padding: 12px 24px; border-radius: 6px; font-size: 15px; font-weight: 700; cursor: pointer; margin-top: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  .toolbar h1 { margin: 0 0 6px; font-size: 18px; }
+  .toolbar .count { font-size: 13px; opacity: 0.9; margin-bottom: 10px; }
+  .toolbar button { background: #fff; color: #1976D2; border: none; padding: 10px 22px; border-radius: 6px; font-size: 15px; font-weight: 700; cursor: pointer; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
   .toolbar button:hover { background: #f0f0f0; }
+  .hint { font-size: 11px; color: rgba(255,255,255,0.75); margin-top: 8px; line-height: 1.5; }
   .container { max-width: 1100px; margin: 16px auto; background: #fff; padding: 16px; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
-  .grid { display: grid; grid-template-columns: repeat(${cols}, 1fr); gap: 6px; }
-  .cell { text-align: center; padding: 6px; page-break-inside: avoid; border: 1px dashed #eee; border-radius: 4px; }
-  .cell img { width: 100%; max-width: ${px}px; height: auto; display: block; margin: 0 auto; }
-  .cell .code { font-family: 'Courier New', monospace; font-size: 9px; margin-top: 4px; color: #000; word-break: break-all; }
-  .cell .name { font-size: 8px; color: #666; margin-top: 2px; }
+  .grid { display: grid; grid-template-columns: repeat(${cols}, 1fr); gap: 4px; }
+  .cell { text-align: center; padding: 6px 4px; page-break-inside: avoid; border: 1px dashed #ccc; }
+  .img-wrap { width: ${px}px; height: ${cellH}px; margin: 0 auto; display: flex; align-items: center; justify-content: center; }
+  .img-wrap img { max-width: 100%; max-height: 100%; display: block; object-fit: contain; }
+  .code { font-family: 'Courier New', monospace; font-size: 8px; margin-top: 3px; color: #000; word-break: break-all; }
+  .name { font-size: 7px; color: #333; margin-top: 1px; }
   @media print {
     .toolbar { display: none; }
     body { background: #fff; padding: 0; }
-    .container { box-shadow: none; padding: 0; max-width: none; margin: 0; }
-    .cell { border: none; }
-    @page { margin: 1cm; }
+    .container { box-shadow: none; padding: 4px; max-width: none; margin: 0; }
+    .cell { border: 1px dashed #aaa; }
+    .code { color: #000; }
+    .name { color: #333; }
+    @page { margin: 0.8cm; }
   }
 </style>
 </head><body>
@@ -377,9 +385,9 @@ function renderPrintHtml(items, type, size) {
     <h1>📄 Кибер-Завхоз — печать кодов</h1>
     <div class="count">${type === 'barcode' ? 'Штрихкоды' : 'QR-коды'} · ${items.length} шт. · размер ${size}</div>
     <button onclick="window.print()">🖨 Печать / Сохранить PDF</button>
-    <div style="font-size:12px;color:#888;margin-top:8px;line-height:1.5">
-      Android: нажмите «Печать» → смените принтер на <b>«Сохранить как PDF»</b><br>
-      iOS: нажмите «Печать» → раздвиньте пальцы на превью → «Поделиться» → «Сохранить в Файлы»
+    <div class="hint">
+      Android: «Печать» → смените принтер на <b>«Сохранить как PDF»</b><br>
+      iOS: «Печать» → раздвиньте пальцы на превью → «Поделиться» → «Сохранить в Файлы»
     </div>
   </div>
   <div class="container">
@@ -394,7 +402,7 @@ async function buildItemsWithImages(items, type) {
   })));
 }
 
-// HTML страница для печати существующих
+// HTML страница для печати существующих (быстро — картинки грузит браузер)
 app.get('/api/export/print', async (req, res) => {
   try {
     const type = req.query.type === 'barcode' ? 'barcode' : 'qr';
@@ -404,14 +412,20 @@ app.get('/api/export/print', async (req, res) => {
       const ids = req.query.ids.split(',').map(Number).filter(Boolean);
       if (ids.length === 0) return res.status(400).send('Пустой список');
       const placeholders = ids.map(() => '?').join(',');
-      const [rows] = await db.query(`SELECT code, name FROM items WHERE id IN (${placeholders}) ORDER BY name`, ids);
+      const [rows] = await db.query(`SELECT id, code, name FROM items WHERE id IN (${placeholders}) ORDER BY name`, ids);
       items = rows;
     } else {
-      const [rows] = await db.query('SELECT code, name FROM items ORDER BY name');
+      const [rows] = await db.query('SELECT id, code, name FROM items ORDER BY name');
       items = rows;
     }
     if (items.length === 0) return res.status(404).send('Нет данных');
-    const withImages = await buildItemsWithImages(items, type);
+    // Используем URL эндпоинтов — браузер грузит картинки сам, ответ мгновенный
+    const withImages = items.map(item => ({
+      ...item,
+      img: type === 'barcode'
+        ? `/api/items/${item.id}/barcode`
+        : `/api/items/${item.id}/qr`,
+    }));
     const html = renderPrintHtml(withImages, type, size);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(html);
