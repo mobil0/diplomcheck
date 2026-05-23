@@ -384,7 +384,7 @@ function renderPrintHtml(items, type, size) {
   <div class="toolbar">
     <h1>📄 Кибер-Завхоз — печать кодов</h1>
     <div class="count">${type === 'barcode' ? 'Штрихкоды' : 'QR-коды'} · ${items.length} шт. · размер ${size}</div>
-    <button onclick="window.print()">🖨 Печать / Сохранить PDF</button>
+    <button id="printBtn" onclick="doPrint()" disabled style="opacity:0.5">⏳ Загрузка...</button>
     <div class="hint">
       Android: «Печать» → смените принтер на <b>«Сохранить как PDF»</b><br>
       iOS: «Печать» → раздвиньте пальцы на превью → «Поделиться» → «Сохранить в Файлы»
@@ -393,6 +393,25 @@ function renderPrintHtml(items, type, size) {
   <div class="container">
     <div class="grid">${cells}</div>
   </div>
+<script>
+  function doPrint() { window.print(); }
+  var imgs = document.querySelectorAll('img');
+  var total = imgs.length, loaded = 0;
+  function onLoad() {
+    loaded++;
+    if (loaded >= total) {
+      var btn = document.getElementById('printBtn');
+      btn.disabled = false;
+      btn.style.opacity = '1';
+      btn.textContent = '🖨 Печать / Сохранить PDF';
+    }
+  }
+  if (total === 0) { onLoad(); }
+  imgs.forEach(function(img) {
+    if (img.complete) { onLoad(); }
+    else { img.addEventListener('load', onLoad); img.addEventListener('error', onLoad); }
+  });
+</script>
 </body></html>`;
 }
 
