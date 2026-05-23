@@ -323,8 +323,8 @@ async function streamPdf(items, options, res) {
 }
 
 // === HTML экспорт для печати/PDF ===
-const SIZE_PX = { small: 90, medium: 140, large: 200 };
-const SIZE_COLS = { small: 5, medium: 4, large: 3 };
+const SIZE_PX = { tiny: 38, small: 90, medium: 140, large: 200 };
+const SIZE_COLS = { tiny: 10, small: 5, medium: 4, large: 3 };
 
 async function genCodeDataUrl(code, type) {
   return genCodeDataUrlCached(code, type);
@@ -483,7 +483,8 @@ app.get('/api/export/print-generate', async (req, res) => {
 });
 
 // === PDF ЭКСПОРТ (скачивание файла) ===
-const PDF_COLS = { small: 5, medium: 4, large: 3 };
+const PDF_COLS = { tiny: 10, small: 5, medium: 4, large: 3 };
+const CYRILLIC_FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 const PAGE_W = 595.28, PAGE_H = 841.89, PDF_MARGIN = 30;
 
 app.get('/api/export/pdf', async (req, res) => {
@@ -516,6 +517,7 @@ app.get('/api/export/pdf', async (req, res) => {
     const cellH = imgH + textH + 8;
 
     const doc = new PDFDocument({ size: 'A4', margin: 0, autoFirstPage: true });
+    try { doc.font(CYRILLIC_FONT); } catch(e) { /* fallback to default */ }
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="kiber-zavhoz-codes.pdf"`);
     doc.pipe(res);
@@ -771,6 +773,7 @@ app.get('/api/inventory-pdf/:id', async (req, res) => {
     }
 
     const doc = new PDFDocument({ size: 'A4', margin: 40 });
+    try { doc.font(CYRILLIC_FONT); } catch(e) { /* fallback */ }
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="inventory-report.pdf"`);
     doc.pipe(res);
