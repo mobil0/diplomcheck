@@ -377,6 +377,10 @@ function renderPrintHtml(items, type, size) {
     <h1>📄 Кибер-Завхоз — печать кодов</h1>
     <div class="count">${type === 'barcode' ? 'Штрихкоды' : 'QR-коды'} · ${items.length} шт. · размер ${size}</div>
     <button onclick="window.print()">🖨 Печать / Сохранить PDF</button>
+    <div style="font-size:12px;color:#888;margin-top:8px;line-height:1.5">
+      Android: нажмите «Печать» → смените принтер на <b>«Сохранить как PDF»</b><br>
+      iOS: нажмите «Печать» → раздвиньте пальцы на превью → «Поделиться» → «Сохранить в Файлы»
+    </div>
   </div>
   <div class="container">
     <div class="grid">${cells}</div>
